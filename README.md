@@ -2,7 +2,7 @@
   <img src="packaging/icon.svg" alt="Polar app icon" width="120">
 </p>
 <h1 align="center">Polar</h1>
-<p align="center">A local Markdown editor for macOS inspired by Bear, with an interface in Italian.</p>
+<p align="center">A local Markdown editor in Rust for macOS inspired by Bear</p>
 
 ![Polar showing the tag sidebar, note list, and Markdown editor](docs/images/workspace.png)
 
