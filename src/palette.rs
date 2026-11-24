@@ -1,0 +1,10 @@
+pub(crate) const SIDEBAR: u32 = 0x2c2d2f;
+pub(crate) const LIST: u32 = 0x1d1e1f;
+pub(crate) const EDITOR: u32 = 0x1d1e1f;
+pub(crate) const RULE: u32 = 0x2f3031;
+pub(crate) const TEXT: u32 = 0xd8d9da;
+pub(crate) const TITLE: u32 = 0xcbd7e3;
+pub(crate) const MUTED: u32 = 0xa5a5a7;
+pub(crate) const SUBTLE: u32 = 0x818183;
+pub(crate) const SELECTED: u32 = 0x2d2e2f;
+pub(crate) const ACCENT: u32 = 0x52a0dd;

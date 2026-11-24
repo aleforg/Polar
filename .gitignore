@@ -1,0 +1,6 @@
+/target/
+/.cargo-cache/
+.DS_Store
+
+# Local design drafts and review reports
+/design/

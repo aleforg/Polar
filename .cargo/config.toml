@@ -1,0 +1,2 @@
+[build]
+rustc-wrapper = "packaging/gpui-rustc.sh"
