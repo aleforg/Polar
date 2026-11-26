@@ -8,16 +8,11 @@ mod revision;
 mod tag_picker;
 mod widgets;
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::PathBuf,
-    rc::Rc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, ScrollHandle, Styled, Subscription, Task, Window,
+    Render, Styled, Subscription, Task, UniformListScrollHandle, Window,
     component::input::{InputEvent, InputState},
     div,
     prelude::FluentBuilder as _,
@@ -68,7 +63,7 @@ pub(crate) struct Notebook {
     indexing_tags: bool,
     expanded_notes: bool,
     workspace_focus: FocusHandle,
-    note_list_scroll: ScrollHandle,
+    note_list_scroll: UniformListScrollHandle,
     dirty: bool,
     saving: Option<Task<()>>,
     startup_error: Option<String>,
@@ -88,9 +83,9 @@ impl Notebook {
                 Some(format!("Impossibile aprire le note. {error}")),
             ),
         };
-        let selected = notes::visible(&notes, &Filter::Notes, "")
+        let selected = notes::visible_indices(&notes, &Filter::Notes, "")
             .first()
-            .map(|note| note.id);
+            .map(|&index| notes[index].id);
         let indexing_tags = Self::index_tags(&notes, cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Ricerca"));
         let tag_icon_search = cx.new(|cx| InputState::new(window, cx).placeholder("Ricerca"));
@@ -183,7 +178,7 @@ impl Notebook {
             indexing_tags,
             expanded_notes: true,
             workspace_focus,
-            note_list_scroll: ScrollHandle::new(),
+            note_list_scroll: UniformListScrollHandle::new(),
             dirty: false,
             saving: None,
             startup_error,
@@ -196,36 +191,59 @@ impl Notebook {
     fn index_tags(notes: &[Note], cx: &mut Context<Self>) -> bool {
         let candidates: Vec<_> = notes
             .iter()
-            .filter(|note| !note.trashed && !note.archived && note.text.contains('#'))
+            .enumerate()
+            .filter(|(_, note)| {
+                !note.trashed && !note.archived && notes::tags::may_have_tags(note.text())
+            })
             .collect();
-        if candidates.len() < 64
-            && candidates.iter().map(|note| note.text.len()).sum::<usize>() < 65536
-        {
+        let bytes = candidates
+            .iter()
+            .map(|(_, note)| note.text().len())
+            .sum::<usize>();
+        if candidates.len() < 64 && bytes < 65536 {
             return false;
         }
-        let sources: Vec<_> = candidates
+        // Bound simultaneous parses and keep large individual documents on one worker.
+        let workers = if candidates.len() >= 256
+            && bytes >= 262_144
+            && candidates
+                .iter()
+                .all(|(_, note)| note.text().len() <= 262_144)
+        {
+            std::thread::available_parallelism().map_or(1, |count| count.get().min(4))
+        } else {
+            1
+        };
+        let mut indexed: Vec<_> = candidates
             .into_iter()
-            .map(|note| (note.id, note.text.clone()))
+            .map(|(index, note)| (index, note.text_snapshot(), BTreeSet::new()))
             .collect();
-        let worker = cx.background_executor().spawn(async move {
+        let executor = cx.background_executor().clone();
+        let worker = executor.clone().spawn(async move {
             let _timing = crate::performance::Sample::start("tag_index");
-            sources
-                .into_iter()
-                .map(|(id, source)| {
-                    let tags = notes::tags(&source);
-                    (id, (source, tags))
+            let chunk_size = indexed.len().div_ceil(workers);
+            executor
+                .scoped(|scope| {
+                    for chunk in indexed.chunks_mut(chunk_size) {
+                        scope.spawn(async move {
+                            for (_, source, tags) in chunk {
+                                *tags = notes::tags(source);
+                            }
+                        });
+                    }
                 })
-                .collect::<HashMap<_, _>>()
+                .await;
+            indexed
         });
         cx.spawn(async move |this, cx| {
-            let mut indexed = worker.await;
+            let indexed = worker.await;
             let _ = this.update(cx, |this, cx| {
-                for note in &mut this.notes {
-                    if let Some(cached) = indexed.remove(&note.id)
-                        && cached.0 == note.text
+                for (index, source, tags) in indexed {
+                    if let Some(note) = this.notes.get(index)
+                        && Arc::ptr_eq(&note.text_snapshot(), &source)
                         && !note.tags_cached()
                     {
-                        *note.tag_cache.get_mut() = cached;
+                        note.prime_tags(tags);
                     }
                 }
                 this.indexing_tags = false;
@@ -280,25 +298,30 @@ impl Notebook {
     }
 
     fn update_text(&mut self, text: String, cx: &mut Context<Self>) {
-        let tags = self.source.cached_tags(&text);
         if let Some(note) = self
-            .selected_mut()
-            .filter(|note| note.text != text && note.can_edit())
+            .notes
+            .iter_mut()
+            .find(|note| Some(note.id) == self.selected)
+            .filter(|note| note.can_edit() && note.text() != text)
         {
+            let tags = self.source.cached_tags(&text);
             note.created.get_or_insert(note.modified);
+            note.set_text(text);
             if let Some(tags) = tags {
-                *note.tag_cache.get_mut() = (text.clone(), tags);
+                note.prime_tags(tags);
             }
-            note.text = text;
             note.modified = notes::now();
             self.changed(cx);
         }
     }
 
     fn reselect(&mut self) {
-        let results = notes::visible(&self.notes, &self.filter, &self.query);
-        if !results.iter().any(|note| Some(note.id) == self.selected) {
-            self.select_note(results.first().map(|note| note.id));
+        let results = notes::visible_indices(&self.notes, &self.filter, &self.query);
+        if !results
+            .iter()
+            .any(|&index| Some(self.notes[index].id) == self.selected)
+        {
+            self.select_note(results.first().map(|&index| self.notes[index].id));
         }
         self.panel = Panel::None;
     }
@@ -354,7 +377,7 @@ impl Notebook {
     fn duplicate_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_editor(cx);
         if let Some(note) = self.selected().filter(|note| !note.trashed) {
-            self.add_note(note.text.clone(), window, cx);
+            self.add_note(note.text().to_owned(), window, cx);
         }
     }
 
@@ -372,19 +395,9 @@ impl Notebook {
             return;
         };
         let now = notes::now();
-        self.notes.push(Note {
-            id,
-            text,
-            tag_cache: Default::default(),
-            thumbnail_cache: Default::default(),
-            search_cache: Default::default(),
-            pinned: false,
-            trashed: false,
-            archived: false,
-            read_only: false,
-            created: Some(now),
-            modified: now,
-        });
+        let mut note = Note::new(id, text, now);
+        note.created = Some(now);
+        self.notes.push(note);
         self.select_note(Some(id));
         self.panel = Panel::None;
         self.start_editing(window, cx);
@@ -404,7 +417,7 @@ impl Notebook {
         if self.loaded_note != self.selected {
             self.loaded_note = self.selected;
             if let Some(note) = self.selected() {
-                self.source.load(&note.text);
+                self.source.load(note.text());
             }
         }
         if let Some(note) = self.selected() {
@@ -558,7 +571,7 @@ impl Notebook {
     fn export(&mut self, cx: &mut Context<Self>) {
         let Some(note) = self.selected() else { return };
         let name = note.title().replace(['/', ':'], "-") + ".md";
-        let text = note.text.clone();
+        let text = note.text_snapshot();
         let attachments = self.store.as_ref().map(Store::attachments);
         let folder = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -574,7 +587,7 @@ impl Notebook {
                             if let Some(directory) = attachments {
                                 crate::attachments::export_references(&directory, &path, &text)?;
                             }
-                            std::fs::write(path, text)
+                            std::fs::write(path, text.as_bytes())
                         })
                         .await
                 }
@@ -700,6 +713,18 @@ pub(crate) fn run_smoke_test(
                     .timer(Duration::from_millis(450))
                     .await;
                 cx.update(draw);
+                let note_scroll = cx.update(|cx| {
+                    let this = notebook.read(cx);
+                    (this.notes.len() > 30).then(|| this.note_list_scroll.clone())
+                });
+                if let Some(scroll) = note_scroll {
+                    assert!(scroll.is_scrollable(), "Large note lists must support scrolling");
+                    scroll.scroll_to_bottom();
+                    cx.update(draw);
+                    assert_eq!(scroll.is_scrolled_to_end(), Some(true), "Scroll to the last virtual row");
+                    scroll.scroll_to_item_strict(0, gpui_kit::ScrollStrategy::Top);
+                    cx.update(draw);
+                }
                 let editor_frame = cx.update(|cx| {
                     notebook.update(cx, |this, cx| {
                         let frame = this.source.viewport_frame();
@@ -775,7 +800,7 @@ pub(crate) fn run_smoke_test(
                                 this.stop_editing(window, cx);
                                 assert!(!this.editing);
                                 assert!(this.selected().is_some_and(|note| {
-                                    note.text.starts_with("Appunti di viaggio")
+                                    note.text().starts_with("Appunti di viaggio")
                                 }));
                             });
                         })
@@ -803,7 +828,7 @@ pub(crate) fn run_smoke_test(
                 cx.update(draw);
                 cx.update(|cx| {
                     notebook.update(cx, |this, cx| {
-                        let heading = &info::outline(&this.selected().unwrap().text)[2];
+                        let heading = &info::outline(this.selected().unwrap().text())[2];
                         this.jump_to_heading(heading.offset, cx);
                     });
                 });

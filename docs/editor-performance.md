@@ -1,5 +1,33 @@
 # Editor responsiveness
 
+## Archive and preview memory
+
+Compared optimized builds on the same Mac with isolated fixtures and debug assertions enabled. The table reports the median of three launches. Physical footprint was sampled every 12 ms and measured at rest 0.8 seconds after initial rendering and tag indexing.
+
+| Synthetic archive | Peak footprint before → after | Steady footprint before → after | Background tag indexing before → after |
+| --- | ---: | ---: | ---: |
+| 100 notes, 20 paragraphs each, one distinct nested tag per note | 235 → 227 MiB | 191 → 181 MiB | 14.5 → 14.8 ms |
+| 5,000 notes, 8 paragraphs each, no tags | 401 → 236 MiB | 369 → 186 MiB | 308 ms → skipped |
+| 5,000 notes, 8 paragraphs each, one distinct nested tag per note | 525 → 236 MiB | 496 → 192 MiB | 318 → 127 ms |
+| 3,000 notes, 100 paragraphs each, one distinct nested tag per note | 492 → 247 MiB | 468 → 213 MiB | 2,163 → 720 ms |
+
+The fixture uses notes titled `# Nota {i}` with paragraphs containing bold, italic and an emoji. Tagged notes end in `#argomento{i}/idee`. The note list and tag sidebar create UI rows only for the visible range. Metadata caches invalidate on edits and indexing uses shared immutable text snapshots. The indexer uses up to four workers for archives with many small notes and skips notes whose hashes cannot start a tag.
+
+With eight distinct 4,608 × 3,456 JPEG files in the open note, peak physical footprint fell from 1,964 to 238 MiB and steady footprint fell from 1,892 to 147 MiB. Each figure is the median of three launches sampled for 4.5 seconds. ImageIO creates display-sized previews in the native editor and 80-pixel PNG and JPEG thumbnails for the note list. The thumbnail cache keeps up to 64 recently used entries. GIF and WebP list previews use the animation loader.
+
+## Current typing measurements
+
+The GUI harness below sent 35 characters and 35 backspaces per run and verified exact restoration of the original note on disk.
+
+| Active note | Median key handling before → after | 95th percentile before → after | Runs per build |
+| --- | ---: | ---: | ---: |
+| 1,000 formatted paragraphs | 24.35 → 20.79 ms | 27.88 → 22.98 ms | 3 |
+| 200 checklist items | 7.19 → 5.28 ms | 8.59 → 7.66 ms | 2 |
+
+TextKit compares the complete attributed strings before walking individual runs. The editor reuses list styles and checkbox labels, maps Unicode offsets with a sparse table, and reuses parsed styles for edits confined to a final plain-text paragraph. Formatting edits within large documents still use full Markdown parsing.
+
+## Previous editor measurements
+
 Verified on 2026-11-10 with optimized macOS builds and isolated synthetic data.
 
 ## Changes

@@ -311,8 +311,8 @@ impl RichEditor {
     #[cfg(debug_assertions)]
     pub(super) fn smoke_wiki_completion(&self) {
         let mut notes = crate::notes::initial_notes();
-        notes[0].text = "# Roma".into();
-        notes[1].text = "# Romanzo".into();
+        notes[0].set_text("# Roma".into());
+        notes[1].set_text("# Romanzo".into());
         notes.truncate(2);
         let text = &self.delegate.ivars().text;
         self.load("Titolo\n\n🐻 [[ro]] dopo");

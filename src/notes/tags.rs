@@ -7,7 +7,7 @@ pub(crate) struct Tag<'a> {
 }
 
 pub(crate) fn tags(text: &str) -> BTreeSet<String> {
-    if !text.contains('#') {
+    if !may_have_tags(text) {
         return BTreeSet::new();
     }
     let Ok(root) = to_mdast(text, &ParseOptions::gfm()) else {
@@ -27,6 +27,11 @@ pub(crate) fn tags(text: &str) -> BTreeSet<String> {
         }
     }
     tags
+}
+
+pub(crate) fn may_have_tags(text: &str) -> bool {
+    text.match_indices('#')
+        .any(|(offset, _)| text[offset + 1..].starts_with(tag_character))
 }
 
 pub(crate) fn in_text(text: &str) -> impl Iterator<Item = Tag<'_>> {
@@ -90,5 +95,9 @@ mod tests {
             BTreeSet::from(["altra".into(), "una città/idee".into()])
         );
         assert_eq!(in_text("#Una città#").next().unwrap().name, "Una città");
+        assert!(!may_have_tags(
+            "# Titolo\n\n## Sottotitolo\n\nTesto con # e testo."
+        ));
+        assert_eq!(tags("**#Lettūra**"), BTreeSet::from(["lettūra".into()]));
     }
 }

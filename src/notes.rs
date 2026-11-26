@@ -7,22 +7,23 @@ pub(crate) use tags::tags;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::{Ref, RefCell},
+    cell::{OnceCell, RefCell},
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Note {
     pub(crate) id: u64,
-    pub(crate) text: String,
+    text: Arc<String>,
     #[serde(skip)]
-    pub(crate) tag_cache: RefCell<(String, BTreeSet<String>)>,
+    tag_cache: OnceCell<BTreeSet<String>>,
     #[serde(skip)]
-    pub(crate) thumbnail_cache: RefCell<(String, PathBuf, Option<PathBuf>)>,
+    thumbnail_cache: RefCell<Option<(PathBuf, Option<PathBuf>)>>,
     #[serde(skip)]
-    pub(crate) search_cache: RefCell<(String, search::Features)>,
+    search_cache: OnceCell<search::Features>,
     pub(crate) pinned: bool,
     pub(crate) trashed: bool,
     pub(crate) modified: u64,
@@ -35,27 +36,70 @@ pub(crate) struct Note {
 }
 
 impl Note {
-    pub(crate) fn tags_cached(&self) -> bool {
-        self.tag_cache.borrow().0 == self.text
+    pub(crate) fn new(id: u64, text: String, modified: u64) -> Self {
+        Self {
+            id,
+            text: Arc::new(text),
+            tag_cache: OnceCell::new(),
+            thumbnail_cache: RefCell::default(),
+            search_cache: OnceCell::new(),
+            pinned: false,
+            trashed: false,
+            modified,
+            archived: false,
+            read_only: false,
+            created: None,
+        }
     }
 
-    pub(crate) fn tags(&self) -> Ref<'_, BTreeSet<String>> {
-        if !self.tags_cached() {
-            *self.tag_cache.borrow_mut() = (self.text.clone(), tags(&self.text));
-        }
-        Ref::map(self.tag_cache.borrow(), |cached| &cached.1)
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn text_snapshot(&self) -> Arc<String> {
+        Arc::clone(&self.text)
+    }
+
+    pub(crate) fn set_text(&mut self, text: String) {
+        self.text = Arc::new(text);
+        self.invalidate_metadata();
+    }
+
+    pub(crate) fn append_attachment(&mut self, markdown: &str) {
+        let text = Arc::make_mut(&mut self.text);
+        text.push_str("\n\n");
+        text.push_str(markdown);
+        self.invalidate_metadata();
+    }
+
+    fn invalidate_metadata(&mut self) {
+        self.tag_cache.take();
+        self.thumbnail_cache.get_mut().take();
+        self.search_cache.take();
+    }
+
+    pub(crate) fn prime_tags(&self, tags: BTreeSet<String>) {
+        let _ = self.tag_cache.set(tags);
+    }
+
+    pub(crate) fn tags_cached(&self) -> bool {
+        self.tag_cache.get().is_some()
+    }
+
+    pub(crate) fn tags(&self) -> &BTreeSet<String> {
+        self.tag_cache.get_or_init(|| tags(self.text()))
     }
 
     pub(crate) fn thumbnail(&self, directory: &Path) -> Option<PathBuf> {
         let mut cached = self.thumbnail_cache.borrow_mut();
-        if cached.0 != self.text || cached.1 != directory {
-            *cached = (
-                self.text.clone(),
-                directory.to_owned(),
-                crate::attachments::thumbnail(directory, &self.text),
-            );
+        if let Some((cached_directory, path)) = &*cached
+            && cached_directory == directory
+        {
+            return path.clone();
         }
-        cached.2.clone()
+        let path = crate::attachments::thumbnail(directory, self.text());
+        *cached = Some((directory.to_owned(), path.clone()));
+        path
     }
 
     pub(crate) fn title(&self) -> &str {
@@ -69,7 +113,7 @@ impl Note {
     }
 
     pub(crate) fn snippet(&self) -> String {
-        let text = self
+        let mut text = self
             .text
             .lines()
             .skip(1)
@@ -96,7 +140,7 @@ impl Note {
             .filter(|ch| !matches!(ch, '*' | '`'))
             .take(240)
             .collect::<String>();
-        let text = text.trim_end().to_owned();
+        text.truncate(text.trim_end().len());
         if self.text.trim().is_empty() {
             "Mantieni la calma e scrivi qualcosa".into()
         } else {
@@ -121,23 +165,24 @@ pub(crate) enum Filter {
     Tag(String),
 }
 
-pub(crate) fn all_tags<'a>(notes: impl IntoIterator<Item = &'a Note>) -> BTreeSet<String> {
+pub(crate) fn all_tags<'a>(notes: impl IntoIterator<Item = &'a Note>) -> BTreeSet<&'a str> {
     let mut tags = BTreeSet::new();
     for note in notes
         .into_iter()
         .filter(|note| !note.trashed && !note.archived)
     {
-        tags.extend(note.tags().iter().cloned());
+        tags.extend(note.tags().iter().map(String::as_str));
     }
     tags
 }
 
-pub(crate) fn visible<'a>(notes: &'a [Note], filter: &Filter, query: &str) -> Vec<&'a Note> {
+pub(crate) fn visible_indices(notes: &[Note], filter: &Filter, query: &str) -> Vec<usize> {
     let query = search::Search::new(query);
-    let today = Local::now().date_naive();
+    let today = (*filter == Filter::Today).then(|| Local::now().date_naive());
     let mut matches = notes
         .iter()
-        .filter(|note| {
+        .enumerate()
+        .filter(|(_, note)| {
             let in_section = match filter {
                 Filter::Trash => note.trashed,
                 Filter::Archive => note.archived && !note.trashed,
@@ -154,7 +199,7 @@ pub(crate) fn visible<'a>(notes: &'a [Note], filter: &Filter, query: &str) -> Ve
                             .ok()
                             .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
                             .is_some_and(|created| {
-                                created.with_timezone(&Local).date_naive() == today
+                                Some(created.with_timezone(&Local).date_naive()) == today
                             })
                     }
                     Filter::Pinned => note.pinned,
@@ -167,8 +212,12 @@ pub(crate) fn visible<'a>(notes: &'a [Note], filter: &Filter, query: &str) -> Ve
                 }
                 && query.matches(note)
         })
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    matches.sort_by_key(|note| std::cmp::Reverse((note.pinned, note.modified, note.id)));
+    matches.sort_unstable_by_key(|&index| {
+        let note = &notes[index];
+        std::cmp::Reverse((note.pinned, note.modified, note.id))
+    });
     matches
 }
 
@@ -190,18 +239,14 @@ pub(crate) fn initial_notes() -> Vec<Note> {
     ]
     .into_iter()
     .enumerate()
-    .map(|(index, (text, pinned))| Note {
-        id: index as u64 + 1,
-        text: text.into(),
-        tag_cache: RefCell::default(),
-        thumbnail_cache: RefCell::default(),
-        search_cache: RefCell::default(),
-        pinned,
-        trashed: false,
-        archived: false,
-        read_only: false,
-        created: None,
-        modified: 1_763_660_400 - index as u64 * 86_400,
+    .map(|(index, (text, pinned))| {
+        let mut note = Note::new(
+            index as u64 + 1,
+            text.into(),
+            1_763_660_400 - index as u64 * 86_400,
+        );
+        note.pinned = pinned;
+        note
     })
     .collect()
 }
@@ -210,14 +255,21 @@ pub(crate) fn initial_notes() -> Vec<Note> {
 mod tests {
     use super::*;
 
+    fn visible<'a>(notes: &'a [Note], filter: &Filter, query: &str) -> Vec<&'a Note> {
+        visible_indices(notes, filter, query)
+            .into_iter()
+            .map(|index| &notes[index])
+            .collect()
+    }
+
     #[test]
     fn tag_cache_tracks_edits_and_is_not_persisted() {
         let mut note = initial_notes().remove(0);
-        note.text = "#alpha".into();
+        note.set_text("#alpha".into());
         assert_eq!(*note.tags(), BTreeSet::from(["alpha".into()]));
-        note.text = "#bravo".into();
+        note.set_text("#bravo".into());
         assert_eq!(*note.tags(), BTreeSet::from(["bravo".into()]));
-        note.text.clear();
+        note.set_text(String::new());
         assert!(note.tags().is_empty());
         let json = serde_json::to_value(&note).unwrap();
         assert!(json.get("tag_cache").is_none());
@@ -235,9 +287,9 @@ mod tests {
             ("`codice`", "@code"),
             ("![Foto](a.png)", "@images"),
         ] {
-            notes[0].text = source.into();
+            notes[0].set_text(source.into());
             assert_eq!(visible(&notes, &Filter::Notes, query).len(), 1);
-            notes[0].text.clear();
+            notes[0].set_text(String::new());
             assert!(visible(&notes, &Filter::Notes, query).is_empty());
         }
     }
@@ -249,7 +301,7 @@ mod tests {
         std::fs::write(directory.path().join("image-a.png"), b"fixture").unwrap();
         std::fs::write(other.path().join("image-a.png"), b"fixture").unwrap();
         let mut note = initial_notes().remove(0);
-        note.text = "![Immagine](attachments/image-a.png)".into();
+        note.set_text("![Immagine](attachments/image-a.png)".into());
         assert_eq!(
             note.thumbnail(directory.path()),
             Some(directory.path().join("image-a.png"))
@@ -258,7 +310,7 @@ mod tests {
             note.thumbnail(other.path()),
             Some(other.path().join("image-a.png"))
         );
-        note.text = "Nessuna immagine".into();
+        note.set_text("Nessuna immagine".into());
         assert!(note.thumbnail(directory.path()).is_none());
         assert!(
             serde_json::to_value(&note)
@@ -269,14 +321,36 @@ mod tests {
     }
 
     #[test]
+    fn appending_an_attachment_invalidates_cached_metadata_and_keeps_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image-a.png");
+        std::fs::write(&path, b"fixture").unwrap();
+        let mut notes = [Note::new(1, "Titolo\n\n#prima".into(), 0)];
+        let snapshot = notes[0].text_snapshot();
+        assert!(notes[0].tags().contains("prima"));
+        assert!(notes[0].thumbnail(directory.path()).is_none());
+        assert!(visible(&notes, &Filter::Notes, "@images").is_empty());
+
+        notes[0].append_attachment("![Foto](attachments/image-a.png)\n\n#dopo");
+
+        assert_eq!(snapshot.as_str(), "Titolo\n\n#prima");
+        assert!(notes[0].tags().contains("dopo"));
+        assert_eq!(notes[0].thumbnail(directory.path()), Some(path));
+        assert_eq!(visible(&notes, &Filter::Notes, "@images").len(), 1);
+    }
+
+    #[test]
     fn snippet_is_bounded_without_truncating_the_note() {
         let mut note = initial_notes().remove(0);
-        note.text = format!("# Titolo\n\n{}", "Testo 🐻 **formattato**. ".repeat(10000));
-        let original = note.text.clone();
+        note.set_text(format!(
+            "# Titolo\n\n{}",
+            "Testo 🐻 **formattato**. ".repeat(10000)
+        ));
+        let original = note.text().to_owned();
         let snippet = note.snippet();
         assert!(snippet.chars().count() <= 240);
         assert!(snippet.starts_with("Testo 🐻 formattato."));
-        assert_eq!(note.text, original);
+        assert_eq!(note.text(), original);
     }
 
     #[test]

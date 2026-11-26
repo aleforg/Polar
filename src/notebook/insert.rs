@@ -98,8 +98,7 @@ impl Notebook {
                         .iter_mut()
                         .find(|note| note.id == note_id && note.can_edit())
                     {
-                        note.text.push_str("\n\n");
-                        note.text.push_str(&markdown);
+                        note.append_attachment(&markdown);
                         note.created.get_or_insert(note.modified);
                         note.modified = crate::notes::now();
                         this.changed(cx);

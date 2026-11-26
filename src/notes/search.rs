@@ -57,12 +57,7 @@ impl Search {
         if self.terms.is_empty() {
             return true;
         }
-        let text = if self.title_only {
-            note.title()
-        } else {
-            &note.text
-        }
-        .to_lowercase();
+        let mut text = None;
         self.terms.iter().all(|term| {
             let matches = match (term.phrase, term.value.as_str()) {
                 (false, "@pinned") => note.pinned,
@@ -75,10 +70,22 @@ impl Search {
                 (false, "@code") => note.search_features().code,
                 (false, "@untagged") => note.tags().is_empty(),
                 (false, "@todo") => note.search_features().todo,
-                (false, "@done") => note.search_features().done && !note.search_features().todo,
-                (false, "@wikilinks") => !super::links::wiki_links(&note.text).is_empty(),
+                (false, "@done") => {
+                    let features = note.search_features();
+                    features.done && !features.todo
+                }
+                (false, "@wikilinks") => !super::links::wiki_links(note.text()).is_empty(),
                 (false, "@images") => note.search_features().images,
-                (_, value) => text.contains(value),
+                (_, value) => text
+                    .get_or_insert_with(|| {
+                        if self.title_only {
+                            note.title()
+                        } else {
+                            note.text()
+                        }
+                        .to_lowercase()
+                    })
+                    .contains(value),
             };
             matches != term.excluded
         })
@@ -95,11 +102,9 @@ pub(crate) struct Features {
 
 impl Note {
     pub(super) fn search_features(&self) -> Features {
-        let mut cached = self.search_cache.borrow_mut();
-        if cached.0 != self.text {
-            *cached = (self.text.clone(), Features::parse(&self.text));
-        }
-        cached.1
+        *self
+            .search_cache
+            .get_or_init(|| Features::parse(self.text()))
     }
 }
 

@@ -10,6 +10,7 @@ mod cursors;
 mod highlights;
 mod layout;
 mod math;
+mod offsets;
 #[cfg(debug_assertions)]
 mod smoke;
 mod viewport;

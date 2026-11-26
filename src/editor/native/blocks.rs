@@ -1,8 +1,8 @@
+use super::offsets::Offsets;
 use std::{cell::OnceCell, ops::Range};
 
 use objc2::{
-    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
-    rc::Retained, sel,
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, sel,
 };
 use objc2_app_kit::{
     NSAccessibility, NSBox, NSBoxType, NSButton, NSFont, NSImage, NSImageSymbolConfiguration,
@@ -20,6 +20,7 @@ use crate::{
 };
 
 const ROW_HEIGHT: f64 = 27.;
+const IMAGE_HEIGHT: f64 = 340.;
 
 define_class!(
     #[unsafe(super(NSView))]
@@ -138,9 +139,19 @@ impl MarkdownDelegate {
                             image.clone()
                         } else {
                             let path = attachments::resolve(&state.attachments, url)?;
-                            let image = NSImage::initWithContentsOfFile(
-                                NSImage::alloc(),
-                                &NSString::from_str(path.to_str()?),
+                            let window = state.text.window();
+                            let screen_width = window
+                                .as_ref()
+                                .and_then(|window| window.screen())
+                                .map_or(width, |screen| screen.frame().size.width)
+                                .max(width);
+                            let scale =
+                                window.map_or(2., |window| window.backingScaleFactor().max(2.));
+                            let image = attachments::preview::editor_image(
+                                &path,
+                                screen_width,
+                                IMAGE_HEIGHT,
+                                scale,
                             )?;
                             images.insert(url.clone(), image.clone());
                             image
@@ -149,7 +160,9 @@ impl MarkdownDelegate {
                         if original.width <= 0. || original.height <= 0. {
                             return None;
                         }
-                        let scale = (width / original.width).min(340. / original.height).min(1.);
+                        let scale = (width / original.width)
+                            .min(IMAGE_HEIGHT / original.height)
+                            .min(1.);
                         let size = NSSize::new(original.width * scale, original.height * scale);
                         (Content::Image { image, alt, size }, size.height + 6.)
                     }
@@ -167,7 +180,7 @@ impl MarkdownDelegate {
     pub(super) fn place_blocks(
         &self,
         previews: &[Preview<'_>],
-        offsets: &[usize],
+        offsets: &Offsets,
         layout: &NSLayoutManager,
         cursors: &mut Vec<(NSRect, Pointer)>,
         value: &str,
@@ -180,7 +193,7 @@ impl MarkdownDelegate {
         let width = state.text.bounds().size.width - HEADING_GUTTER * 2.;
         let mtm = self.mtm();
         for preview in previews {
-            let start = offsets[preview.source.start];
+            let start = offsets.utf16(preview.source.start);
             // SAFETY: Each preview begins in the text used by this layout, and no output range is needed.
             let glyphs = unsafe {
                 layout.glyphRangeForCharacterRange_actualCharacterRange(

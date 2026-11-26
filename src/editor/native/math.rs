@@ -1,6 +1,7 @@
+use super::offsets::Offsets;
 use objc2::{AnyThread, extern_class, extern_methods, rc::Retained};
 use objc2_app_kit::NSImage;
-use objc2_foundation::{NSData, NSObject, NSRange, NSSize, NSString};
+use objc2_foundation::{NSData, NSMutableAttributedString, NSObject, NSRange, NSSize, NSString};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -264,9 +265,9 @@ impl Renderer {
 }
 
 pub(super) fn apply_layout(
-    storage: &objc2_app_kit::NSTextStorage,
+    storage: &NSMutableAttributedString,
     text: &str,
-    offsets: &[usize],
+    offsets: &Offsets,
     formula: &Formula,
     run: &MathRun,
 ) {
@@ -296,8 +297,7 @@ pub(super) fn apply_layout(
         .find('\n')
         .map_or(text.len(), |len| formula.range.start + len);
     if formula.display || run.size.height > 22. {
-        let start = offsets[paragraph_start];
-        let range = NSRange::new(start, offsets[first_end] - start);
+        let range = offsets.range(paragraph_start, first_end);
         // SAFETY: All indices are UTF-16 offsets in the active text storage and the style is copied before editing.
         unsafe {
             let paragraph = storage
@@ -321,8 +321,7 @@ pub(super) fn apply_layout(
     if formula.display && first_end < formula.range.end {
         let compact = NSMutableParagraphStyle::new();
         compact.setMinimumLineHeight(1.);
-        let start = offsets[first_end + 1];
-        let range = NSRange::new(start, offsets[formula.range.end] - start);
+        let range = offsets.range(first_end + 1, formula.range.end);
         // SAFETY: The compact style applies only to the hidden formula source lines.
         unsafe {
             storage.addAttribute_value_range(NSParagraphStyleAttributeName, &compact, range);

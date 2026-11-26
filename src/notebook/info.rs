@@ -132,7 +132,7 @@ impl Notebook {
         };
         match self.info_tab {
             InfoTab::Stats => {
-                let stats = Statistics::for_note(&note.text);
+                let stats = Statistics::for_note(note.text());
                 let rows = [
                     [
                         ("Parole", stats.words.to_string(), "message-square"),
@@ -190,7 +190,7 @@ impl Notebook {
                     );
             }
             InfoTab::Outline => {
-                let headings = outline(&note.text);
+                let headings = outline(note.text());
                 let mut items = div()
                     .id("note-outline")
                     .flex()
@@ -248,7 +248,7 @@ impl Notebook {
                     .iter()
                     .filter(|candidate| candidate.id != note.id && !candidate.trashed)
                 {
-                    if !links::wiki_links(&candidate.text)
+                    if !links::wiki_links(candidate.text())
                         .iter()
                         .any(|link| links::target(&self.notes, link.title) == Some(note.id))
                     {

@@ -53,6 +53,7 @@ pub(crate) struct LiveMarkdown {
     blocks: Vec<Block>,
     links: Vec<(Range<usize>, DocumentLink)>,
     literal_ranges: Vec<Range<usize>>,
+    plain_tail: Option<usize>,
 }
 
 pub(crate) struct Heading {
@@ -75,7 +76,20 @@ impl LiveMarkdown {
     pub(crate) fn parse(text: &str) -> Self {
         let _timing = crate::performance::Sample::start("parse");
         let mut result = Self::default();
+        let title_end = text.lines().next().map_or(0, str::len);
         if let Some(root) = syntax_tree(text) {
+            if let Some(Node::Paragraph(paragraph)) = root.children().and_then(|nodes| nodes.last())
+                && matches!(paragraph.children.as_slice(), [Node::Text(_)])
+                && let Some(position) = &paragraph.position
+            {
+                let start = position.start.offset;
+                if start > title_end
+                    && (text[..start].ends_with("\n\n") || text[..start].ends_with("\r\n\r\n"))
+                    && plain_tail(&text[start..])
+                {
+                    result.plain_tail = Some(start);
+                }
+            }
             result.blocks = root
                 .children()
                 .into_iter()
@@ -102,7 +116,6 @@ impl LiveMarkdown {
                 );
             }
         }
-        let title_end = text.lines().next().map_or(0, str::len);
         if result
             .headings
             .first()
@@ -118,6 +131,12 @@ impl LiveMarkdown {
             result.style(0..title_end, heading());
         }
         result
+    }
+
+    pub(super) fn can_reuse_after_edit(&self, previous: &str, next: &str) -> bool {
+        self.plain_tail.is_some_and(|start| {
+            next.get(..start) == Some(&previous[..start]) && plain_tail(&next[start..])
+        })
     }
 
     pub(super) fn blocks(&self) -> &[Block] {
@@ -151,21 +170,22 @@ impl LiveMarkdown {
         &self.highlights
     }
 
-    pub(crate) fn hidden_markers(&self, selection: Option<&Range<usize>>) -> Vec<&Range<usize>> {
-        self.markers
-            .iter()
-            .filter_map(|(marker, construct)| {
-                selection
-                    .is_none_or(|selection| {
-                        selection.start > construct.end || selection.end < construct.start
-                    })
-                    .then_some(marker)
-            })
-            .collect()
+    pub(crate) fn hidden_markers<'a>(
+        &'a self,
+        selection: Option<&'a Range<usize>>,
+    ) -> impl Iterator<Item = &'a Range<usize>> {
+        self.markers.iter().filter_map(move |(marker, construct)| {
+            selection
+                .is_none_or(|selection| {
+                    selection.start > construct.end || selection.end < construct.start
+                })
+                .then_some(marker)
+        })
     }
 
     pub(crate) fn decorations(&self, selection: Option<&Range<usize>>) -> Vec<TextDecoration> {
-        let mut styles = self.text_styles.clone();
+        let mut styles = Vec::with_capacity(self.text_styles.len() + self.markers.len());
+        styles.extend_from_slice(&self.text_styles);
         for (marker, construct) in &self.markers {
             let active = selection.is_some_and(|selection| {
                 selection.start <= construct.end && selection.end >= construct.start
@@ -459,6 +479,22 @@ impl LiveMarkdown {
     }
 }
 
+// A final top-level paragraph of plain text cannot change any earlier style or range.
+fn plain_tail(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || !byte.is_ascii())
+        && bytes.all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b' ' | b'.' | b',' | b'!' | b'?' | b'\'')
+                || !byte.is_ascii()
+        })
+        && !text.match_indices('.').any(|(index, _)| {
+            index >= 3 && text.as_bytes()[index - 3..index].eq_ignore_ascii_case(b"www")
+        })
+}
+
 fn heading() -> HighlightStyle {
     HighlightStyle {
         color: Some(rgb(TITLE).into()),
@@ -470,6 +506,28 @@ fn heading() -> HighlightStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuses_formatting_only_for_plain_edits_in_the_final_paragraph() {
+        let prefix = "Titolo 🐻\n\n## Finale\n\n**Un esempio** e $x^2$.\n\n";
+        let previous = format!("{prefix}Testo semplice");
+        let markdown = LiveMarkdown::parse(&previous);
+        for tail in ["Altro testo", "Caffè già pronto. 🐻", "Testo, e altro?"] {
+            assert!(markdown.can_reuse_after_edit(&previous, &format!("{prefix}{tail}")));
+        }
+        for tail in [
+            "",
+            "#tag",
+            "Testo **forte**",
+            "Testo\n---",
+            "Testo WWW.a.it",
+        ] {
+            assert!(!markdown.can_reuse_after_edit(&previous, &format!("{prefix}{tail}")));
+        }
+        assert!(!markdown.can_reuse_after_edit(&previous, &previous.replace("Finale", "Titolo")));
+        let code = "Titolo\n\n```\n\nTesto";
+        assert!(!LiveMarkdown::parse(code).can_reuse_after_edit(code, "Titolo\n\n```\n\nAlfa"));
+    }
 
     #[test]
     fn renders_dashes_as_separators_with_or_without_a_blank_line() {
@@ -541,8 +599,7 @@ mod tests {
         assert!(
             markdown
                 .hidden_markers(None)
-                .iter()
-                .any(|range| &text[(**range).clone()] == "==🟢")
+                .any(|range| &text[range.clone()] == "==🟢")
         );
     }
 

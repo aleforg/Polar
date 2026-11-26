@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) mod preview;
+
 const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
 
 pub(crate) fn resolve(directory: &Path, url: &str) -> Option<PathBuf> {

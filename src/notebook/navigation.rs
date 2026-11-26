@@ -3,24 +3,30 @@ use super::{
     widgets::{drag_area, icon, menu_button, tool},
 };
 use crate::{
-    notes::{self, Filter, tag_icons},
+    notes::{self, Filter, Note, tag_icons},
     palette::{ACCENT, LIST, MUTED, RULE, SELECTED, SIDEBAR, SUBTLE, TEXT, TITLE},
 };
 use chrono::{DateTime, Local};
 use gpui_kit::{
-    ClickEvent, Context, Focusable, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, prelude::FluentBuilder as _,
-    px, rgb,
+    ClickEvent, Context, Div, Focusable, IntoElement, ObjectFit, ParentElement, ScrollStrategy,
+    Styled, StyledImage, Window, div, img, prelude::FluentBuilder as _, px, rgb, uniform_list,
 };
 use gpui_kit::{
     FontWeight, SharedString,
     base::Button,
     component::{input::Input, popover::Popover},
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeMap, ops::Range};
 
 pub(super) const SIDEBAR_WIDTH: f32 = 188.;
 pub(super) const NOTE_LIST_WIDTH: f32 = 314.;
+
+enum SidebarRow {
+    NoteGroup,
+    Filter(Filter, &'static str, &'static str),
+    Tag { name: String, has_children: bool },
+    Spacer,
+}
 
 impl Notebook {
     pub(super) fn step_note(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -34,23 +40,24 @@ impl Notebook {
             return;
         }
         self.sync_editor(cx);
-        let results = notes::visible(&self.notes, &self.filter, &self.query);
+        let results = notes::visible_indices(&self.notes, &self.filter, &self.query);
         let index = match results
             .iter()
-            .position(|note| Some(note.id) == self.selected)
+            .position(|&index| Some(self.notes[index].id) == self.selected)
         {
             Some(current) => current.checked_add_signed(offset),
             None if offset < 0 => results.len().checked_sub(1),
             None => Some(0),
         };
         let Some((index, id)) =
-            index.and_then(|index| results.get(index).map(|note| (index, note.id)))
+            index.and_then(|index| results.get(index).map(|&note| (index, self.notes[note].id)))
         else {
             return;
         };
         self.select_note(Some(id));
         self.workspace_focus.focus(window, cx);
-        self.note_list_scroll.scroll_to_item(index);
+        self.note_list_scroll
+            .scroll_to_item(index, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -71,122 +78,56 @@ impl Notebook {
                     .child(icon("cloud-off", 18., MUTED))
                     .child(self.layout_menu(cx)),
             );
-        let filters = [
-            (Filter::Untagged, "Senza Tag", "inbox"),
-            (Filter::Todo, "ToDo", "square-check"),
-            (Filter::Today, "Oggi", "calendar-days"),
-            (Filter::Pinned, "Fissata", "pin"),
-        ];
-        let mut rows = div()
-            .id("sidebar-rows")
-            .flex()
-            .flex_col()
-            .px(px(8.))
-            .pt(px(11.))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .relative()
-                    .child(self.filter_row(Filter::Notes, "Note".into(), "file-text", 30., cx))
-                    .child(
-                        tool(
-                            "toggle-note-group",
-                            "Espandi o comprimi Note",
-                            if self.expanded_notes {
-                                "chevron-down"
-                            } else {
-                                "chevron-right"
-                            },
-                        )
-                        .absolute()
-                        .left(px(1.))
-                        .top_0()
-                        .w(px(28.))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.expanded_notes = !this.expanded_notes;
-                            cx.notify();
-                        })),
-                    )
-                    .child(div().absolute().right(px(8.)).top(px(6.)).child(icon(
-                        "chevrons-up-down",
-                        15.,
-                        MUTED,
-                    ))),
-            );
+        let mut rows = vec![SidebarRow::NoteGroup];
         if self.expanded_notes {
-            rows = rows.children(filters.into_iter().map(|(filter, label, glyph)| {
-                self.filter_row(filter, label.into(), glyph, 42., cx)
-            }));
+            rows.extend([
+                SidebarRow::Filter(Filter::Untagged, "Senza Tag", "inbox"),
+                SidebarRow::Filter(Filter::Todo, "ToDo", "square-check"),
+                SidebarRow::Filter(Filter::Today, "Oggi", "calendar-days"),
+                SidebarRow::Filter(Filter::Pinned, "Fissata", "pin"),
+            ]);
         }
         if self.notes.iter().any(|note| note.archived && !note.trashed)
             || self.filter == Filter::Archive
         {
-            rows =
-                rows.child(self.filter_row(Filter::Archive, "Archivio".into(), "archive", 30., cx));
+            rows.push(SidebarRow::Filter(Filter::Archive, "Archivio", "archive"));
         }
-        rows = rows.child(self.filter_row(Filter::Trash, "Cestino".into(), "trash", 30., cx));
+        rows.push(SidebarRow::Filter(Filter::Trash, "Cestino", "trash"));
         let tags = notes::all_tags(self.notes.iter().filter(|note| {
             !self.indexing_tags || self.selected == Some(note.id) || note.tags_cached()
         }));
-        let entries = tags
-            .iter()
-            .flat_map(|tag| {
-                tag.match_indices('/')
-                    .map(|(offset, _)| &tag[..offset])
-                    .chain(std::iter::once(tag.as_str()))
-            })
-            .collect::<BTreeSet<_>>();
-        rows = rows.child(div().h(px(14.)));
-        for tag in &entries {
-            let visible = tag
-                .match_indices('/')
-                .all(|(offset, _)| self.expanded_tags.contains(&tag[..offset]));
-            if !visible {
-                continue;
+        let mut entries = BTreeMap::new();
+        for tag in tags {
+            for (offset, _) in tag.match_indices('/') {
+                entries.insert(&tag[..offset], true);
             }
-            let indent = tag.bytes().filter(|byte| *byte == b'/').count() as f32 * 15.;
-            let label = tag.rsplit('/').next().unwrap_or(tag);
-            let button = self.filter_row(
-                Filter::Tag((*tag).to_owned()),
-                label.into(),
-                tag_icons::resolve(&self.tag_icons, tag).glyph(),
-                30. + indent,
-                cx,
-            );
-            let mut row = div()
-                .relative()
-                .child(self.tag_context_menu(button, tag, cx));
-            if entries.iter().any(|child| {
-                child
-                    .strip_prefix(tag)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
-                let tag = (*tag).to_owned();
-                let glyph = if self.expanded_tags.contains(&tag) {
-                    "chevron-down"
-                } else {
-                    "chevron-right"
-                };
-                row = row.child(
-                    tool(
-                        SharedString::from(format!("toggle-tag-{tag}")),
-                        "Espandi o comprimi tag",
-                        glyph,
-                    )
-                    .absolute()
-                    .left(px(indent + 1.))
-                    .top_0()
-                    .w(px(28.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.expanded_tags.remove(&tag) {
-                            this.expanded_tags.insert(tag.clone());
-                        }
-                        cx.notify();
-                    })),
-                );
-            }
-            rows = rows.child(row);
+            entries.entry(tag).or_insert(false);
         }
+        if !entries.is_empty() {
+            rows.push(SidebarRow::Spacer);
+        }
+        rows.extend(
+            entries
+                .into_iter()
+                .filter(|(tag, _)| {
+                    tag.match_indices('/')
+                        .all(|(offset, _)| self.expanded_tags.contains(&tag[..offset]))
+                })
+                .map(|(tag, has_children)| SidebarRow::Tag {
+                    name: tag.to_owned(),
+                    has_children,
+                }),
+        );
+        let list = uniform_list(
+            "sidebar-rows",
+            rows.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                rows[range]
+                    .iter()
+                    .map(|row| this.sidebar_row(row, cx))
+                    .collect()
+            }),
+        );
         div()
             .flex()
             .flex_col()
@@ -194,7 +135,95 @@ impl Notebook {
             .flex_shrink_0()
             .bg(rgb(SIDEBAR))
             .child(header)
-            .child(rows)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .px(px(8.))
+                    .pt(px(11.))
+                    .child(list.size_full()),
+            )
+    }
+
+    fn sidebar_row(&self, row: &SidebarRow, cx: &mut Context<Self>) -> Div {
+        let item = div().relative().w_full().h(px(28.));
+        match row {
+            SidebarRow::NoteGroup => item
+                .child(self.filter_row(Filter::Notes, "Note".into(), "file-text", 30., cx))
+                .child(
+                    tool(
+                        "toggle-note-group",
+                        "Espandi o comprimi Note",
+                        if self.expanded_notes {
+                            "chevron-down"
+                        } else {
+                            "chevron-right"
+                        },
+                    )
+                    .absolute()
+                    .left(px(1.))
+                    .top_0()
+                    .w(px(28.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.expanded_notes = !this.expanded_notes;
+                        cx.notify();
+                    })),
+                )
+                .child(div().absolute().right(px(8.)).top(px(6.)).child(icon(
+                    "chevrons-up-down",
+                    15.,
+                    MUTED,
+                ))),
+            SidebarRow::Filter(filter, label, glyph) => {
+                let indent = if matches!(filter, Filter::Archive | Filter::Trash) {
+                    30.
+                } else {
+                    42.
+                };
+                item.child(self.filter_row(filter.clone(), (*label).into(), glyph, indent, cx))
+            }
+            SidebarRow::Tag { name, has_children } => {
+                let indent = name.bytes().filter(|byte| *byte == b'/').count() as f32 * 15.;
+                let label = name.rsplit('/').next().unwrap_or(name);
+                let button = self.filter_row(
+                    Filter::Tag(name.clone()),
+                    label.into(),
+                    tag_icons::resolve(&self.tag_icons, name).glyph(),
+                    30. + indent,
+                    cx,
+                );
+                item.child(self.tag_context_menu(button, name, cx))
+                    .when(*has_children, |item| {
+                        let glyph = if self.expanded_tags.contains(name) {
+                            "chevron-down"
+                        } else {
+                            "chevron-right"
+                        };
+                        let name = name.clone();
+                        item.child(
+                            tool(
+                                SharedString::from(format!("toggle-tag-{name}")),
+                                "Espandi o comprimi tag",
+                                glyph,
+                            )
+                            .absolute()
+                            .left(px(indent + 1.))
+                            .top_0()
+                            .w(px(28.))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if !this.expanded_tags.remove(&name) {
+                                        this.expanded_tags.insert(name.clone());
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
+            }
+            SidebarRow::Spacer => item,
+        }
     }
 
     fn filter_row(
@@ -387,15 +416,11 @@ impl Notebook {
                         ),
                 )
             });
-        let results = notes::visible(&self.notes, &self.filter, &self.query);
+        let results = notes::visible_indices(&self.notes, &self.filter, &self.query);
         let mut rows = div()
-            .id("note-list-rows")
-            .track_scroll(&self.note_list_scroll)
-            .flex()
-            .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .px(px(10.))
             .pt(px(3.));
         if results.is_empty() {
@@ -406,95 +431,21 @@ impl Notebook {
                     .text_color(rgb(SUBTLE))
                     .child("Nessuna nota"),
             );
-        }
-        for note in results {
-            let id = note.id;
-            let active = self.selected == Some(id);
-            let title = note.title();
-            let button = Button::new(("note-row", id))
-                .accessibility_label(title.to_owned())
-                .w_full()
-                .flex()
-                .flex_col()
-                .items_start()
-                .justify_start()
-                .text_left()
-                .px(px(13.))
-                .pt(px(10.))
-                .pb(px(10.))
-                .min_h(px(103.))
-                .rounded(px(6.))
-                .when(active, |row| row.bg(rgb(SELECTED)))
-                .child(
-                    div()
-                        .w_full()
-                        .line_clamp(2)
-                        .text_ellipsis()
-                        .line_height(px(18.))
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(TITLE))
-                        .child(title.to_owned()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .w_full()
-                        .min_h(px(36.))
-                        .mt(px(4.))
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .line_clamp(2)
-                                .text_ellipsis()
-                                .line_height(px(19.))
-                                .text_size(px(14.))
-                                .text_color(rgb(MUTED))
-                                .child(note.snippet()),
-                        )
-                        .children(
-                            self.store
-                                .as_ref()
-                                .and_then(|store| note.thumbnail(&store.attachments()))
-                                .map(|path| {
-                                    img(path)
-                                        .size(px(40.))
-                                        .rounded(px(5.))
-                                        .object_fit(ObjectFit::Cover)
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .mt(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(7.))
-                        .text_size(px(12.))
-                        .text_color(rgb(SUBTLE))
-                        .when(note.pinned, |row| row.child(icon("pin", 13., ACCENT)))
-                        .child(date_label(note.modified)),
-                )
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.sync_editor(cx);
-                    this.select_note(Some(id));
-                    this.panel = Panel::None;
-                    if event.click_count() == 2 {
-                        this.start_editing(window, cx);
-                    }
-                    cx.notify();
-                }));
+        } else {
+            let count = results.len();
             rows = rows.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_shrink_0()
-                    .child(button)
-                    .when(!active, |row| {
-                        row.child(div().mx(px(13.)).h(px(1.)).flex_shrink_0().bg(rgb(RULE)))
+                uniform_list(
+                    "note-list-rows",
+                    count,
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        results[range]
+                            .iter()
+                            .map(|&index| this.note_row(&this.notes[index], cx))
+                            .collect()
                     }),
+                )
+                .track_scroll(&self.note_list_scroll)
+                .size_full(),
             );
         }
         div()
@@ -507,6 +458,104 @@ impl Notebook {
             .border_color(rgb(RULE))
             .child(search)
             .child(rows)
+    }
+
+    fn note_row(&self, note: &Note, cx: &Context<Self>) -> Div {
+        let id = note.id;
+        let active = self.selected == Some(id);
+        let title = note.title();
+        let button = Button::new(("note-row", id))
+            .accessibility_label(title.to_owned())
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_start()
+            .justify_start()
+            .text_left()
+            .px(px(13.))
+            .pt(px(8.))
+            .pb(px(8.))
+            .h_full()
+            .rounded(px(6.))
+            .when(active, |row| row.bg(rgb(SELECTED)))
+            .child(
+                div()
+                    .w_full()
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .line_height(px(18.))
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(TITLE))
+                    .child(title.to_owned()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_h(px(36.))
+                    .mt(px(4.))
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .line_height(px(19.))
+                            .text_size(px(14.))
+                            .text_color(rgb(MUTED))
+                            .child(note.snippet()),
+                    )
+                    .children(
+                        self.store
+                            .as_ref()
+                            .and_then(|store| note.thumbnail(&store.attachments()))
+                            .map(|path| {
+                                img(crate::attachments::preview::list_image(path))
+                                    .size(px(40.))
+                                    .rounded(px(5.))
+                                    .object_fit(ObjectFit::Cover)
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .line_height(px(15.))
+                    .text_size(px(12.))
+                    .text_color(rgb(SUBTLE))
+                    .when(note.pinned, |row| row.child(icon("pin", 13., ACCENT)))
+                    .child(date_label(note.modified)),
+            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.sync_editor(cx);
+                this.select_note(Some(id));
+                this.panel = Panel::None;
+                if event.click_count() == 2 {
+                    this.start_editing(window, cx);
+                }
+                cx.notify();
+            }));
+        div()
+            .relative()
+            .w_full()
+            .h(px(116.))
+            .child(button)
+            .when(!active, |row| {
+                row.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(13.))
+                        .right(px(13.))
+                        .h(px(1.))
+                        .bg(rgb(RULE)),
+                )
+            })
     }
 }
 

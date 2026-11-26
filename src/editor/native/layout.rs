@@ -8,7 +8,8 @@ use objc2::{
 };
 use objc2_app_kit::*;
 use objc2_foundation::{
-    NSDictionary, NSMutableDictionary, NSNumber, NSPoint, NSRange, NSRect, NSSize, NSString,
+    NSAttributedString, NSDictionary, NSMutableAttributedString, NSMutableDictionary, NSNumber,
+    NSPoint, NSRange, NSRect, NSSize, NSString, ns_string,
 };
 
 use super::{
@@ -18,6 +19,7 @@ use super::{
     cursors::{CursorTextView, Pointer},
     highlights::Highlight,
     math::{self, MathRun},
+    offsets::Offsets,
 };
 use crate::editor::markdown_lists::{ListLine, ListMarker};
 use crate::{
@@ -112,7 +114,7 @@ impl MarkdownDelegate {
     fn place_decorations(
         &self,
         markdown: &LiveMarkdown,
-        offsets: &[usize],
+        offsets: &Offsets,
         previews: &[Preview<'_>],
         presentation: &DecorationState,
         value: &str,
@@ -155,8 +157,8 @@ impl MarkdownDelegate {
             let y = if heading.range.is_empty() {
                 origin.y + 19.
             } else {
-                let start = offsets[heading.range.start];
-                let end = offsets[heading.range.end];
+                let start = offsets.utf16(heading.range.start);
+                let end = offsets.utf16(heading.range.end);
                 // SAFETY: The character range maps to this layout’s current UTF-16 text.
                 let glyphs = unsafe {
                     layout.glyphRangeForCharacterRange_actualCharacterRange(
@@ -190,8 +192,7 @@ impl MarkdownDelegate {
             let Some(width) = tag.standalone_width else {
                 continue;
             };
-            let start = offsets[tag.range.start];
-            let range = NSRange::new(start, offsets[tag.range.end] - start);
+            let range = offsets.range(tag.range.start, tag.range.end);
             // SAFETY: The range maps to the current text storage and no output range is needed.
             let glyphs = unsafe {
                 layout.glyphRangeForCharacterRange_actualCharacterRange(range, std::ptr::null_mut())
@@ -271,7 +272,7 @@ impl MarkdownDelegate {
             if entry.prefix.is_empty() {
                 continue;
             }
-            let range = NSRange::new(offsets[entry.prefix.start], 1);
+            let range = NSRange::new(offsets.utf16(entry.prefix.start), 1);
             // SAFETY: The marker offset and glyph both belong to this layout.
             let (glyph, line) = unsafe {
                 let glyph = layout
@@ -351,16 +352,6 @@ impl MarkdownDelegate {
                 list_markers.push(marker);
                 continue;
             };
-            let label = NSString::from_str(if *checked {
-                "Riapri attività"
-            } else {
-                "Completa attività"
-            });
-            let symbol = NSString::from_str(if *checked {
-                "checkmark.square"
-            } else {
-                "square"
-            });
             let reusable = previous_checkboxes.next().and_then(|button| {
                 if (button.state() != 0) == *checked {
                     Some(button)
@@ -371,47 +362,63 @@ impl MarkdownDelegate {
             });
             let button = if let Some(button) = reusable {
                 button
-            } else if let Some(image) =
-                NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, Some(&label))
-            {
-                let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(21., 0.);
-                let image = image.imageWithSymbolConfiguration(&config).unwrap_or(image);
-                // SAFETY: The image is retained and the delegate implements toggleTask: for NSButton.
-                let button = unsafe {
-                    NSButton::buttonWithImage_target_action(
-                        &image,
-                        Some(self),
-                        Some(sel!(toggleTask:)),
-                        self.mtm(),
-                    )
-                };
-                button.setBordered(false);
-                button.setContentTintColor(Some(&color(if *checked {
-                    0x737578
-                } else {
-                    0xa5a5a7
-                })));
-                // SAFETY: The checkbox role is an exported AppKit constant.
-                button.setAccessibilityRole(Some(unsafe { NSAccessibilityCheckBoxRole }));
-                // SAFETY: The checkbox accessibility value is an NSNumber with a boolean value.
-                unsafe {
-                    button
-                        .setAccessibilityValue(Some(&NSNumber::numberWithInt(i32::from(*checked))));
-                }
-                button
             } else {
-                // SAFETY: The delegate implements toggleTask: for NSButton and the title is an NSString.
-                unsafe {
-                    NSButton::checkboxWithTitle_target_action(
-                        &NSString::from_str(""),
-                        Some(self),
-                        Some(sel!(toggleTask:)),
-                        self.mtm(),
+                let (label, symbol) = if *checked {
+                    (
+                        ns_string!("Riapri attività"),
+                        ns_string!("checkmark.square"),
                     )
-                }
+                } else {
+                    (ns_string!("Completa attività"), ns_string!("square"))
+                };
+                let button = if let Some(image) =
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(label))
+                {
+                    let config =
+                        NSImageSymbolConfiguration::configurationWithPointSize_weight(21., 0.);
+                    let image = image.imageWithSymbolConfiguration(&config).unwrap_or(image);
+                    // SAFETY: The image is retained and the delegate implements toggleTask: for NSButton.
+                    let button = unsafe {
+                        NSButton::buttonWithImage_target_action(
+                            &image,
+                            Some(self),
+                            Some(sel!(toggleTask:)),
+                            self.mtm(),
+                        )
+                    };
+                    button.setBordered(false);
+                    button.setContentTintColor(Some(&color(if *checked {
+                        0x737578
+                    } else {
+                        0xa5a5a7
+                    })));
+                    // SAFETY: The checkbox role is an exported AppKit constant.
+                    button.setAccessibilityRole(Some(unsafe { NSAccessibilityCheckBoxRole }));
+                    // SAFETY: The checkbox accessibility value is an NSNumber with a boolean value.
+                    unsafe {
+                        button.setAccessibilityValue(Some(&NSNumber::numberWithInt(i32::from(
+                            *checked,
+                        ))));
+                    }
+                    button
+                } else {
+                    // SAFETY: The delegate implements toggleTask: for NSButton and the title is an NSString.
+                    unsafe {
+                        NSButton::checkboxWithTitle_target_action(
+                            ns_string!(""),
+                            Some(self),
+                            Some(sel!(toggleTask:)),
+                            self.mtm(),
+                        )
+                    }
+                };
+                button.setAccessibilityLabel(Some(label));
+                button
             };
-            button.setAccessibilityLabel(Some(&label));
-            button.setTag(offsets[*offset] as isize);
+            let tag = offsets.utf16(*offset) as isize;
+            if button.tag() != tag {
+                button.setTag(tag);
+            }
             let enabled = state.mode.get() != super::EditorMode::Protected;
             if button.isEnabled() != enabled {
                 button.setEnabled(enabled);
@@ -448,46 +455,34 @@ impl MarkdownDelegate {
         if state.busy.get() || NSTextInputClient::hasMarkedText(&*state.text) {
             return;
         }
-        let value = state.text.string().to_string();
+        let native_value = state.text.string();
+        let value = native_value.to_string();
         let selection = NSTextInputClient::selectedRange(&*state.text);
-        let mut offsets = vec![0; value.len() + 1];
-        let mut utf16 = 0;
-        for (index, ch) in value.char_indices() {
-            offsets[index] = utf16;
-            utf16 += ch.len_utf16();
-        }
-        offsets[value.len()] = utf16;
-        let to_bytes = |offset: usize| {
-            let mut length = 0;
-            value
-                .char_indices()
-                .find_map(|(index, ch)| {
-                    let start = length;
-                    length += ch.len_utf16();
-                    (offset < length || offset == start).then_some(index)
-                })
-                .unwrap_or(value.len())
-        };
+        let offsets = Offsets::new(&value);
         let focused = state
             .text
             .window()
             .is_some_and(|window| window.firstResponder().as_deref() == Some(state.text.as_ref()));
         let selection = (state.mode.get() == EditorMode::Editing && focused).then(|| {
-            to_bytes(selection.location)
-                ..to_bytes(selection.location.saturating_add(selection.length))
+            offsets.byte(&value, selection.location)
+                ..offsets.byte(&value, selection.location.saturating_add(selection.length))
         });
         let mut cached = state.markdown.borrow_mut();
         let changed = cached.0 != value;
         if changed {
-            cached.1 = LiveMarkdown::parse(&value);
-            math::retain_formulas(cached.1.formulas());
-            cached.0 = value.clone();
+            if !cached.1.can_reuse_after_edit(&cached.0, &value) {
+                let markdown = LiveMarkdown::parse(&value);
+                math::retain_formulas(markdown.formulas());
+                cached.1 = markdown;
+            }
+            cached.0 = value;
+        } else {
+            drop(value);
         }
-        let markdown = &cached.1;
+        let (value, markdown) = &*cached;
         let previews = self.prepare_blocks(markdown.blocks(), selection.as_ref());
         let mut hidden: Vec<_> = markdown
             .hidden_markers(selection.as_ref())
-            .into_iter()
             .cloned()
             .collect();
         hidden.extend(previews.iter().map(|preview| preview.source.clone()));
@@ -509,8 +504,7 @@ impl MarkdownDelegate {
                     .iter()
                     .find(|heading| heading.range.contains(&formula.range.start))
                     .map_or(BODY_FONT_SIZE, |heading| heading.size());
-                let start = offsets[formula.range.start];
-                let range = NSRange::new(start, offsets[formula.range.end] - start);
+                let range = offsets.range(formula.range.start, formula.range.end);
                 let indent = markdown
                     .list_lines()
                     .iter()
@@ -534,7 +528,7 @@ impl MarkdownDelegate {
         });
         let tag_pills = tag_pills(
             markdown,
-            &value,
+            value,
             selection.as_ref(),
             width,
             &state.tag_icons.borrow(),
@@ -560,26 +554,22 @@ impl MarkdownDelegate {
         }
         // Build the desired attributes off-screen. Only differing runs are applied
         // to the live storage, preserving TextKit's layout for unchanged paragraphs.
-        // SAFETY: NSTextStorage inherits the attributed-string initializer; it
-        // receives a valid NSString and returns a retained storage instance.
-        let storage: Retained<NSTextStorage> = unsafe {
-            objc2::msg_send![NSTextStorage::alloc(), initWithString: &*NSString::from_str(&value)]
-        };
+        let storage = NSMutableAttributedString::initWithString(
+            NSMutableAttributedString::alloc(),
+            &native_value,
+        );
         storage.beginEditing();
-        let body_font = NSFont::systemFontOfSize(BODY_FONT_SIZE);
-        let foreground = color(TEXT);
         let paragraph = NSMutableParagraphStyle::new();
         paragraph.setMinimumLineHeight(26.);
-        let total = NSRange::new(0, utf16);
-        // SAFETY: The whole range matches the current UTF-16 length and the values are AppKit attribute types.
-        unsafe {
-            storage.setAttributes_range(None, total);
-            storage.addAttribute_value_range(NSFontAttributeName, &body_font, total);
-            storage.addAttribute_value_range(NSForegroundColorAttributeName, &foreground, total);
-            storage.addAttribute_value_range(NSParagraphStyleAttributeName, &paragraph, total);
-        }
+        let total = NSRange::new(0, native_value.length());
         let font_manager = NSFontManager::sharedFontManager(self.mtm());
-        let mut boundaries = vec![0, value.len()];
+        let base = RunStyle::default().attributes(&font_manager, &paragraph);
+        // SAFETY: The base dictionary contains AppKit values and applies to the full string.
+        unsafe { storage.setAttributes_range(Some(&base), total) };
+        let mut boundaries = Vec::with_capacity(
+            2 + 2 * (decorations.len() + markdown.headings().len() + previews.len()),
+        );
+        boundaries.extend([0, value.len()]);
         for decoration in &decorations {
             boundaries.extend([decoration.range.start, decoration.range.end]);
         }
@@ -620,7 +610,7 @@ impl MarkdownDelegate {
                     }
                 }
             }
-            let range = NSRange::new(offsets[start], offsets[end] - offsets[start]);
+            let range = offsets.range(start, end);
             let heading = markdown
                 .headings()
                 .iter()
@@ -667,8 +657,7 @@ impl MarkdownDelegate {
             }
         }
         for (index, (link, _)) in markdown.links().iter().enumerate().rev() {
-            let start = offsets[link.start];
-            let range = NSRange::new(start, offsets[link.end] - start);
+            let range = offsets.range(link.start, link.end);
             // SAFETY: The link range belongs to this text storage and the delegate handles the NSString identifier.
             unsafe {
                 storage.addAttribute_value_range(
@@ -695,29 +684,31 @@ impl MarkdownDelegate {
             } else {
                 paragraph.setMinimumLineHeight(if heading.level == 1 { 48. } else { 35. });
             }
-            let range = NSRange::new(
-                offsets[range.start],
-                offsets[range.end] - offsets[range.start],
-            );
+            let range = offsets.range(range.start, range.end);
             // SAFETY: The heading range maps to current storage and the value is a paragraph style.
             unsafe {
                 storage.addAttribute_value_range(NSParagraphStyleAttributeName, &paragraph, range);
             }
         }
+        let mut list_styles = std::collections::BTreeMap::new();
+        let hidden_font = NSFont::systemFontOfSize(0.01);
+        let hidden_color = NSColor::clearColor();
         for entry in markdown.list_lines() {
-            let start = offsets[entry.range.start];
-            let range = NSRange::new(start, offsets[entry.range.end] - start);
-            let paragraph = NSMutableParagraphStyle::new();
-            paragraph.setMinimumLineHeight(27.);
-            let indent = list_indent(entry);
-            paragraph.setFirstLineHeadIndent(indent);
-            paragraph.setHeadIndent(indent);
+            let range = offsets.range(entry.range.start, entry.range.end);
+            let paragraph = list_styles
+                .entry((entry.depth, entry.extra_digits))
+                .or_insert_with(|| {
+                    let paragraph = NSMutableParagraphStyle::new();
+                    paragraph.setMinimumLineHeight(27.);
+                    let indent = list_indent(entry);
+                    paragraph.setFirstLineHeadIndent(indent);
+                    paragraph.setHeadIndent(indent);
+                    paragraph
+                });
             // SAFETY: The list entry belongs to current storage and the value is a paragraph style.
             unsafe {
-                storage.addAttribute_value_range(NSParagraphStyleAttributeName, &paragraph, range);
+                storage.addAttribute_value_range(NSParagraphStyleAttributeName, paragraph, range);
             }
-            let hidden_font = NSFont::systemFontOfSize(0.01);
-            let hidden_color = NSColor::clearColor();
             for (index, line) in value[entry.range.clone()].split_inclusive('\n').scan(
                 entry.range.start,
                 |start, line| {
@@ -731,7 +722,7 @@ impl MarkdownDelegate {
                 } else {
                     index + line.len() - line.trim_start_matches([' ', '\t']).len()
                 };
-                let prefix = NSRange::new(offsets[index], offsets[end] - offsets[index]);
+                let prefix = offsets.range(index, end);
                 // SAFETY: Prefix offsets are character boundaries in the current storage.
                 unsafe {
                     storage.addAttribute_value_range(NSFontAttributeName, &hidden_font, prefix);
@@ -744,9 +735,7 @@ impl MarkdownDelegate {
             }
         }
         for preview in &previews {
-            let start = offsets[preview.source.start];
-            let end = offsets[preview.source.end];
-            let range = NSRange::new(start, end - start);
+            let range = offsets.range(preview.source.start, preview.source.end);
             let paragraph = NSMutableParagraphStyle::new();
             paragraph.setMinimumLineHeight(preview.line_height);
             // SAFETY: Both attributes apply to a valid UTF-16 source range and use native AppKit types.
@@ -762,8 +751,7 @@ impl MarkdownDelegate {
         let mut inline_icons = Vec::new();
         let mut highlights = Vec::new();
         for tag in &presentation.tag_pills {
-            let start = offsets[tag.range.start];
-            let range = NSRange::new(start, offsets[tag.range.end] - start);
+            let range = offsets.range(tag.range.start, tag.range.end);
             // SAFETY: The tag's range maps to the current text storage.
             unsafe { storage.removeAttribute_range(NSBackgroundColorAttributeName, range) };
             if tag.standalone_width.is_some() {
@@ -786,7 +774,7 @@ impl MarkdownDelegate {
                     );
                 }
             } else if tag.visible {
-                let hash = NSRange::new(start, 1);
+                let hash = NSRange::new(range.location, 1);
                 // SAFETY: The leading hash is one UTF-16 unit in the current storage.
                 unsafe {
                     storage.addAttribute_value_range(
@@ -800,7 +788,7 @@ impl MarkdownDelegate {
                         hash,
                     );
                 }
-                inline_icons.push((start, tag.icon));
+                inline_icons.push((range.location, tag.icon));
                 highlights.push(Highlight {
                     range,
                     fill: 0x424344,
@@ -814,7 +802,7 @@ impl MarkdownDelegate {
             state.text.setNeedsDisplay(true);
         }
         for (formula, run) in &math {
-            math::apply_layout(&storage, &value, &offsets, formula, run);
+            math::apply_layout(&storage, value, &offsets, formula, run);
         }
         let math_changed = state
             .highlight_layout
@@ -830,9 +818,8 @@ impl MarkdownDelegate {
                 .iter()
                 .find(|heading| heading.range.contains(&range.start))
                 .map_or(BODY_FONT_SIZE, |heading| heading.size());
-            let start = offsets[range.start];
             Some(Highlight {
-                range: NSRange::new(start, offsets[range.end] - start),
+                range: offsets.range(range.start, range.end),
                 fill: *fill,
                 height: size * 0.5 + 16.5,
                 radius: 3.,
@@ -842,6 +829,7 @@ impl MarkdownDelegate {
             state.text.setNeedsDisplay(true);
         }
         storage.endEditing();
+        storage.fixAttributesInRange(total);
         apply_changed_attributes(&live_storage, &storage);
         if math_changed {
             // SAFETY: The full UTF-16 range matches the current storage and no output range is needed.
@@ -862,7 +850,7 @@ impl MarkdownDelegate {
             }
             state.text.setNeedsDisplay(true);
         }
-        self.place_decorations(markdown, &offsets, &previews, &presentation, &value);
+        self.place_decorations(markdown, &offsets, &previews, &presentation, value);
         state.decoration_state.replace(presentation);
         if let Some(undo) = &undo {
             undo.enableUndoRegistration();
@@ -937,11 +925,15 @@ impl RunStyle {
     }
 }
 
-fn apply_changed_attributes(live: &NSTextStorage, desired: &NSTextStorage) {
+fn apply_changed_attributes(live: &NSTextStorage, desired: &NSAttributedString) {
     let _timing = crate::performance::Sample::start("attributes");
+    if live.isEqualToAttributedString(desired) {
+        return;
+    }
+    let length = desired.length();
     let mut index = 0;
     live.beginEditing();
-    while index < desired.length() {
+    while index < length {
         let mut old_range = NSRange::default();
         let mut new_range = NSRange::default();
         // SAFETY: Both storages contain the same UTF-16 string; index is in bounds

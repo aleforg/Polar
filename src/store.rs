@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(saved.tag_icons, tag_icons);
         let saved = saved.notes;
         assert!(saved[0].archived && saved[0].trashed && saved[0].pinned && saved[0].read_only);
-        assert_eq!(saved[0].text, "Legacy");
+        assert_eq!(saved[0].text(), "Legacy");
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
                 ..
             },
         ) = Store::open(&path).unwrap();
-        notes[0].text = "Test di persistenza 🐻".into();
+        notes[0].set_text("Test di persistenza 🐻".into());
         store.save(&notes, &tag_icons).unwrap();
         assert!(Store::open(&path).is_err());
         fs::create_dir(path.join("notes.json.pending")).unwrap();
@@ -148,7 +148,7 @@ mod tests {
         fs::remove_dir(path.join("notes.json.pending")).unwrap();
         drop(store);
         let (store, saved) = Store::open(&path).unwrap();
-        assert_eq!(saved.notes[0].text, notes[0].text);
+        assert_eq!(saved.notes[0].text(), notes[0].text());
         drop(store);
         fs::write(path.join("notes.json"), b"invalid").unwrap();
         assert!(Store::open(&path).is_err());

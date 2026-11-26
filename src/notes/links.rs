@@ -150,14 +150,14 @@ mod tests {
     #[test]
     fn prefers_title_prefixes_and_excludes_trash_and_duplicates() {
         let mut notes = crate::notes::initial_notes();
-        notes[0].text = "# Appunti su Roma".into();
-        notes[1].text = "# Romanzo".into();
-        notes[2].text = "# ROMA".into();
-        notes[3].text = "# Roma".into();
+        notes[0].set_text("# Appunti su Roma".into());
+        notes[1].set_text("# Romanzo".into());
+        notes[2].set_text("# ROMA".into());
+        notes[3].set_text("# Roma".into());
         notes[3].modified = notes[2].modified + 1;
-        notes[4].text = "# Roma sparita".into();
+        notes[4].set_text("# Roma sparita".into());
         notes[4].trashed = true;
-        notes[5].text = "# Roma *corsivo*".into();
+        notes[5].set_text("# Roma *corsivo*".into());
         assert_eq!(
             suggested_titles(&notes, "rOma"),
             ["Roma", "Romanzo", "Appunti su Roma"]
